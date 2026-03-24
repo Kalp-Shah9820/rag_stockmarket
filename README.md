@@ -117,3 +117,4 @@ RAG/
 ├── docker-compose.yml      — PostgreSQL container
 └── Dockerfile              — App container
 ```
+
