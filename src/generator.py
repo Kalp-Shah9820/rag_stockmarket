@@ -1,0 +1,113 @@
+"""
+LLM Answer Generator — builds a grounded prompt from retrieved chunks,
+calls the LLM, and returns an answer with citations.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from typing import List
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from loguru import logger
+
+from src.config import settings
+from src.models import RetrievedChunk, GeneratedAnswer, Citation
+
+
+def _build_context(chunks: List[RetrievedChunk]) -> str:
+    """Format retrieved chunks into a numbered context block."""
+    parts = []
+    for i, rc in enumerate(chunks, 1):
+        meta_str = ""
+        if rc.chunk.title:
+            meta_str += f" | Title: {rc.chunk.title}"
+        if rc.chunk.metadata.get("date"):
+            meta_str += f" | Date: {rc.chunk.metadata['date']}"
+        if rc.chunk.metadata.get("source"):
+            meta_str += f" | Source: {rc.chunk.metadata['source']}"
+        parts.append(f"[Source {i}{meta_str}]\n{rc.chunk.content}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _extract_citations(
+    answer: str, chunks: List[RetrievedChunk]
+) -> List[Citation]:
+    """Parse [Source N] references from the answer text."""
+    pattern = r"\[Source\s+(\d+)\]"
+    found = set(int(m) for m in re.findall(pattern, answer))
+    citations = []
+    for idx in sorted(found):
+        if 1 <= idx <= len(chunks):
+            rc = chunks[idx - 1]
+            citations.append(
+                Citation(
+                    source_index=idx,
+                    title=rc.chunk.title,
+                    snippet=rc.chunk.content[:200],
+                    doc_id=rc.chunk.doc_id,
+                )
+            )
+    return citations
+
+
+def generate_answer(
+    query: str, chunks: List[RetrievedChunk]
+) -> GeneratedAnswer:
+    """
+    Generate a grounded answer using the LLM.
+    - Constructs context from chunks
+    - Calls OpenAI LLM
+    - Extracts inline citations
+    """
+    cfg = settings.generator
+    t0 = time.perf_counter()
+
+    # Build prompt
+    context = _build_context(chunks)
+    user_prompt = (
+        f"Context:\n{context}\n\n"
+        f"---\n\n"
+        f"Question: {query}\n\n"
+        f"Instructions:\n"
+        f"- Answer using ONLY the information in the context above.\n"
+        f"- Cite every claim using [Source N] notation.\n"
+        f"- If you cannot answer from the context, say so explicitly.\n"
+    )
+
+    # Call LLM
+    llm = ChatOpenAI(
+        model=cfg.model,
+        temperature=cfg.temperature,
+        max_tokens=cfg.max_tokens,
+    )
+    messages = [
+        SystemMessage(content=cfg.system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+
+    logger.info(f"💬 Calling LLM ({cfg.model}) ...")
+    response = llm.invoke(messages)
+    answer_text = response.content
+
+    # Extract citations
+    citations = _extract_citations(answer_text, chunks)
+
+    latency = (time.perf_counter() - t0) * 1000
+
+    result = GeneratedAnswer(
+        query=query,
+        answer=answer_text,
+        citations=citations,
+        chunks_used=chunks,
+        is_grounded=len(citations) > 0,
+        latency_ms=round(latency, 1),
+    )
+
+    logger.info(
+        f"✅ Generated answer ({len(answer_text)} chars, "
+        f"{len(citations)} citations, {latency:.0f}ms)"
+    )
+    return result
