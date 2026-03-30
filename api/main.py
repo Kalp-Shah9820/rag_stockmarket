@@ -19,6 +19,7 @@ from loguru import logger
 from src.config import settings
 from src.models import QueryInput, GeneratedAnswer, HealthResponse
 from src.database import check_connection, get_chunk_count, init_database
+from src.gemini_client import validate_gemini_configuration
 from src.graph import run_agent
 
 
@@ -28,10 +29,14 @@ async def lifespan(app: FastAPI):
     """Startup / shutdown hooks."""
     logger.info("🚀 Starting RAG Stock Market API")
     try:
+        if settings.generator.provider == "gemini" and settings.generator.validate_model_on_startup:
+            active_model = validate_gemini_configuration()
+            logger.info(f"✅ Gemini ready with model: {active_model}")
+
         init_database()
         logger.info("✅ Database ready")
     except Exception as e:
-        logger.warning(f"⚠️  Database init skipped: {e}")
+        logger.warning(f"⚠️  Startup initialization skipped: {e}")
     yield
     logger.info("👋 Shutting down")
 
@@ -68,7 +73,18 @@ async def ask(payload: QueryInput):
         return answer
     except Exception as e:
         logger.error(f"❌ /ask error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return a gracefully handled answer instead of crashing the UI with a 500.
+        return GeneratedAnswer(
+            query=payload.query,
+            answer=(
+                f"⚠️ **System Error**: {str(e)}\n\n"
+                "The AI pipeline could not complete this request. Check your "
+                "Gemini API key, configured model availability, and data index status."
+            ),
+            is_grounded=False,
+            latency_ms=0.0
+        )
+
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -88,15 +104,17 @@ async def stats():
         count = get_chunk_count()
         return {
             "total_chunks": count,
-            "database": settings.database.name,
+            "vector_db_type": settings.vector_db.type,
+            "collection_name": settings.vector_db.collection_name,
             "embedding_model": settings.embedding.model_name,
             "reranker_model": settings.reranker.model_name,
         }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Run with: uvicorn api.main:app --reload ──────────────────
+# ── Run with: python -m uvicorn api.main:app --reload ────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)

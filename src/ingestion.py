@@ -3,7 +3,7 @@ Data Ingestion Pipeline
 - Loads XA7 Stock Market News dataset from HuggingFace
 - Chunks documents with RecursiveCharacterTextSplitter
 - Generates embeddings
-- Stores in PostgreSQL / pgvector
+- Stores in ChromaDB
 """
 
 from __future__ import annotations
@@ -12,7 +12,8 @@ import hashlib
 from typing import List
 
 from datasets import load_dataset
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from loguru import logger
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
@@ -20,6 +21,7 @@ from src.config import settings
 from src.models import DocumentChunk
 from src.embeddings import get_embeddings
 from src.database import init_database, insert_chunks, get_chunk_count
+from src.keyword_search import update_bm25_index
 
 
 def load_xa7_dataset() -> list[dict]:
@@ -38,7 +40,7 @@ def _doc_id(text: str) -> str:
 
 
 def chunk_documents(records: list[dict]) -> List[DocumentChunk]:
-    """Split raw records into overlapping chunks."""
+    """Split raw records into overlapping chunks with robust field mapping."""
     cfg = settings.chunking
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=cfg.chunk_size,
@@ -54,31 +56,52 @@ def chunk_documents(records: list[dict]) -> List[DocumentChunk]:
         transient=True,
     ) as progress:
         task = progress.add_task("Chunking documents...", total=len(records))
+        
+        # Verbose debug for first record
+        if records:
+            logger.debug(f"First record keys: {list(records[0].keys())}")
+            
         for record in records:
-            # Adapt to dataset schema — typical fields: title, text/content
-            title = record.get("title", "")
-            text = record.get("text", record.get("content", ""))
+            # Helper to get field case-insensitively
+            def get_field(keys_to_try):
+                for k in record.keys():
+                    if k.lower() in keys_to_try:
+                        return record[k]
+                return None
+
+            title = get_field(["headline", "title", "name", "description"]) or ""
+            text = get_field(["text", "content", "body"]) or title
+            
             if not text:
                 progress.advance(task)
                 continue
-
-            doc_id = _doc_id(text)
-            splits = splitter.split_text(text)
+            
+            # Default source for this dataset is 'news'
+            source = get_field(["source"]) or "news"
+            date = get_field(["date", "time"]) or ""
+            label = get_field(["label", "target"]) or ""
+            
+            doc_id = _doc_id(str(text))
+            splits = splitter.split_text(str(text))
 
             for idx, split_text in enumerate(splits):
+                category = get_field(["category", "genre"]) or ""
+                
                 chunk = DocumentChunk(
                     doc_id=doc_id,
-                    title=title,
-                    content=split_text,
+                    title=str(title),
+                    content=str(split_text),
                     chunk_index=idx,
                     metadata={
-                        "source": record.get("source", ""),
-                        "date": record.get("date", ""),
-                        "url": record.get("url", ""),
-                        "category": record.get("category", ""),
+                        "source": str(source),
+                        "date": str(date),
+                        "url": str(get_field(["url", "link"]) or ""),
+                        "category": str(category),
+                        "label": str(label),
                     },
                 )
                 chunks.append(chunk)
+
             progress.advance(task)
 
     logger.info(f"✂️  Created {len(chunks):,} chunks from {len(records):,} documents")
@@ -133,13 +156,19 @@ def run_ingestion():
     chunks = chunk_documents(records)
 
     # 5. Embed
-    chunks = embed_chunks(chunks)
+    if chunks:
+        chunks = embed_chunks(chunks)
+        
+        # 6. Store
+        insert_chunks(chunks)
 
-    # 6. Store
-    insert_chunks(chunks)
-
-    total = get_chunk_count()
-    logger.info(f"🎉 Ingestion complete — {total:,} chunks in database")
+        # 7. Update BM25 Index
+        update_bm25_index(chunks)
+        
+        total = get_chunk_count()
+        logger.info(f"🎉 Ingestion complete — {total:,} chunks in database")
+    else:
+        logger.warning("⚠️ No chunks created. Ingestion stopped.")
 
 
 if __name__ == "__main__":

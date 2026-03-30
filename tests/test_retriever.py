@@ -37,11 +37,9 @@ def test_row_to_chunk():
 
 # ── Test hybrid retrieval (mocked DB) ───────────────────────
 @patch("src.retriever.vector_search")
-@patch("src.retriever.fts_search")
+@patch("src.retriever.bm25_search")
 @patch("src.retriever.embed_query")
-def test_hybrid_retrieve_merges_results(
-    mock_embed, mock_fts, mock_vector
-):
+def test_hybrid_retrieve_merges_results(mock_embed, mock_bm25, mock_vector):
     from src.retriever import hybrid_retrieve
 
     mock_embed.return_value = [0.1] * 384
@@ -55,7 +53,7 @@ def test_hybrid_retrieve_merges_results(
     ]
 
     # FTS returns 2 results (one overlapping)
-    mock_fts.return_value = [
+    mock_bm25.return_value = [
         {"id": "b", "doc_id": "d2", "title": "T2", "content": "C2",
          "chunk_index": 0, "metadata": {}, "score": 5.0},
         {"id": "c", "doc_id": "d3", "title": "T3", "content": "C3",
@@ -75,14 +73,14 @@ def test_hybrid_retrieve_merges_results(
 
 # ── Test empty results ──────────────────────────────────────
 @patch("src.retriever.vector_search")
-@patch("src.retriever.fts_search")
+@patch("src.retriever.bm25_search")
 @patch("src.retriever.embed_query")
-def test_hybrid_retrieve_empty(mock_embed, mock_fts, mock_vector):
+def test_hybrid_retrieve_empty(mock_embed, mock_bm25, mock_vector):
     from src.retriever import hybrid_retrieve
 
     mock_embed.return_value = [0.1] * 384
     mock_vector.return_value = []
-    mock_fts.return_value = []
+    mock_bm25.return_value = []
 
     results = hybrid_retrieve("nonexistent query")
     assert results == []

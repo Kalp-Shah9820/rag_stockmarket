@@ -13,7 +13,9 @@ from loguru import logger
 from src.config import settings
 from src.models import DocumentChunk, RetrievedChunk
 from src.embeddings import embed_query
-from src.database import vector_search, fts_search
+from src.database import vector_search
+from src.keyword_search import bm25_search
+
 
 
 def _row_to_chunk(row: dict) -> DocumentChunk:
@@ -33,24 +35,25 @@ def _reciprocal_rank(rank: int, k: int = 60) -> float:
     return 1.0 / (k + rank)
 
 
-def hybrid_retrieve(query: str) -> List[RetrievedChunk]:
+def hybrid_retrieve(query: str, source_filter: Optional[str] = None) -> List[RetrievedChunk]:
     """
-    Perform hybrid retrieval:
-    1. Vector search (cosine similarity via pgvector)
-    2. Full-text search (BM25-style via PostgreSQL tsvector)
-    3. Merge with weighted Reciprocal Rank Fusion
-    4. Deduplicate and return top-k
+    Perform hybrid retrieval with optional source filtering.
     """
     cfg = settings.retrieval
-
+    
+    # Prepare filter for ChromaDB and BM25
+    filter_dict = {"source": source_filter} if source_filter else None
+    
     # ── Step 1: Vector search ────────────────────────────────
     query_emb = embed_query(query)
-    vec_results = vector_search(query_emb, top_k=cfg.vector_top_k)
+    vec_results = vector_search(query_emb, top_k=cfg.vector_top_k, filter_dict=filter_dict)
     logger.debug(f"Vector search returned {len(vec_results)} results")
+    
+    # ── Step 2: Keyword search ─────────────────────────────
+    fts_results = bm25_search(query, top_k=cfg.fts_top_k, filter_dict=filter_dict)
+    logger.debug(f"Keyword search returned {len(fts_results)} results")
 
-    # ── Step 2: Full-text search ─────────────────────────────
-    fts_results = fts_search(query, top_k=cfg.fts_top_k)
-    logger.debug(f"FTS returned {len(fts_results)} results")
+
 
     # ── Step 3: Weighted RRF merge ───────────────────────────
     scored: dict[str, RetrievedChunk] = {}

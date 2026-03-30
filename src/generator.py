@@ -9,17 +9,18 @@ import re
 import time
 from typing import List
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 from loguru import logger
 
 from src.config import settings
+from src.gemini_client import generate_text_with_retry, resolve_generation_model
 from src.models import RetrievedChunk, GeneratedAnswer, Citation
 
 
 def _build_context(chunks: List[RetrievedChunk]) -> str:
     """Format retrieved chunks into a numbered context block."""
+    cfg = settings.generator
     parts = []
+    current_chars = 0
     for i, rc in enumerate(chunks, 1):
         meta_str = ""
         if rc.chunk.title:
@@ -28,7 +29,12 @@ def _build_context(chunks: List[RetrievedChunk]) -> str:
             meta_str += f" | Date: {rc.chunk.metadata['date']}"
         if rc.chunk.metadata.get("source"):
             meta_str += f" | Source: {rc.chunk.metadata['source']}"
-        parts.append(f"[Source {i}{meta_str}]\n{rc.chunk.content}")
+        content = rc.chunk.content[: cfg.max_chunk_chars]
+        block = f"[Source {i}{meta_str}]\n{content}"
+        if parts and current_chars + len(block) > cfg.max_context_chars:
+            break
+        parts.append(block)
+        current_chars += len(block)
     return "\n\n---\n\n".join(parts)
 
 
@@ -77,20 +83,17 @@ def generate_answer(
         f"- If you cannot answer from the context, say so explicitly.\n"
     )
 
-    # Call LLM
-    llm = ChatOpenAI(
-        model=cfg.model,
+    selected_model = resolve_generation_model()
+    logger.info(f"Calling Gemini model '{selected_model}' for answer generation")
+    answer_text = generate_text_with_retry(
+        user_prompt,
+        system_instruction=cfg.system_prompt,
+        preferred_model=selected_model,
         temperature=cfg.temperature,
-        max_tokens=cfg.max_tokens,
+        max_output_tokens=cfg.max_tokens,
+        retry_max_output_tokens=cfg.retry_max_tokens,
+        thinking_budget=cfg.thinking_budget,
     )
-    messages = [
-        SystemMessage(content=cfg.system_prompt),
-        HumanMessage(content=user_prompt),
-    ]
-
-    logger.info(f"💬 Calling LLM ({cfg.model}) ...")
-    response = llm.invoke(messages)
-    answer_text = response.content
 
     # Extract citations
     citations = _extract_citations(answer_text, chunks)

@@ -21,27 +21,18 @@ CONFIG_PATH = ROOT_DIR / "config" / "settings.yaml"
 
 
 # ── Sub-models ───────────────────────────────────────────────
-class DatabaseConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 5432
-    name: str = "rag_stockmarket"
-    user: str = "rag_user"
-    password: str = "rag_password"
-    pool_size: int = 5
+class VectorDBConfig(BaseModel):
+    type: str = "chroma"
+    persist_directory: str = "./data/chroma_db"
+    collection_name: str = "stock_news_chunks"
+    distance_metric: str = "cosine"
 
-    @property
-    def url(self) -> str:
-        return (
-            f"postgresql://{self.user}:{self.password}"
-            f"@{self.host}:{self.port}/{self.name}"
-        )
+class KeywordSearchConfig(BaseModel):
+    type: str = "bm25"
+    persist_path: str = "./data/bm25_index.pkl"
+    k1: float = 1.5
+    b: float = 0.75
 
-    @property
-    def async_url(self) -> str:
-        return (
-            f"postgresql+asyncpg://{self.user}:{self.password}"
-            f"@{self.host}:{self.port}/{self.name}"
-        )
 
 
 class EmbeddingConfig(BaseModel):
@@ -74,9 +65,20 @@ class RerankerConfig(BaseModel):
 
 
 class GeneratorConfig(BaseModel):
-    model: str = "gpt-4o-mini"
+    provider: str = "gemini"
+    model: str = "gemini-2.5-flash"
+    fallback_models: List[str] = [
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+    ]
     temperature: float = 0.1
     max_tokens: int = 1024
+    retry_max_tokens: int = 2048
+    thinking_budget: int = 0
+    max_context_chars: int = 12000
+    max_chunk_chars: int = 2500
+    timeout_seconds: int = 30
+    validate_model_on_startup: bool = True
     system_prompt: str = (
         "You are a financial news analyst. Answer questions using ONLY the "
         "provided context. Cite every claim with [Source N]. If the context "
@@ -122,7 +124,8 @@ class AppConfig(BaseModel):
 # ── Master settings ──────────────────────────────────────────
 class Settings(BaseModel):
     app: AppConfig = AppConfig()
-    database: DatabaseConfig = DatabaseConfig()
+    vector_db: VectorDBConfig = VectorDBConfig()
+    keyword_search: KeywordSearchConfig = KeywordSearchConfig()
     embedding: EmbeddingConfig = EmbeddingConfig()
     chunking: ChunkingConfig = ChunkingConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
@@ -135,22 +138,19 @@ class Settings(BaseModel):
 
 
 def load_settings(path: Path = CONFIG_PATH) -> Settings:
-    """Load settings from YAML, overlay with env-vars where applicable."""
+    """Load settings from YAML, overlay with env-vars."""
     if path.exists():
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
     else:
         raw = {}
 
-    # Override database fields from env if present
-    db_overrides = {}
-    for key in ("host", "port", "name", "user", "password"):
-        env_key = f"DATABASE_{key.upper()}"
-        val = os.getenv(env_key)
-        if val is not None:
-            db_overrides[key] = int(val) if key == "port" else val
-    if db_overrides:
-        raw.setdefault("database", {}).update(db_overrides)
+    # Normalize Gemini API key naming. Prefer GEMINI_API_KEY, but keep
+    # GOOGLE_API_KEY as a backward-compatible fallback for existing setups.
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if gemini_key:
+        os.environ["GEMINI_API_KEY"] = gemini_key
+        os.environ["GOOGLE_API_KEY"] = gemini_key
 
     # Override OpenAI key
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -158,6 +158,7 @@ def load_settings(path: Path = CONFIG_PATH) -> Settings:
         os.environ["OPENAI_API_KEY"] = openai_key
 
     return Settings(**raw)
+
 
 
 # Singleton

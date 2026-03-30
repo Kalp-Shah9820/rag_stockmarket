@@ -1,202 +1,136 @@
 """
-Database layer — PostgreSQL + pgvector.
-Handles table creation, vector extension, FTS index, and CRUD.
+Vector Database Layer — ChromaDB implementation.
 """
 
 from __future__ import annotations
 
-import json
 from typing import List, Optional
+import os
+from pathlib import Path
 
-import psycopg2
-import psycopg2.extras
-from pgvector.psycopg2 import register_vector
+import chromadb
+from chromadb.config import Settings as ChromaSettings
 from loguru import logger
 
 from src.config import settings
 from src.models import DocumentChunk
 
 
-# ── Connection helpers ───────────────────────────────────────
-def get_connection():
-    """Return a new psycopg2 connection with pgvector registered."""
-    conn = psycopg2.connect(settings.database.url)
-    register_vector(conn)
-    return conn
+class VectorDB:
+    """Wrapper for ChromaDB operations."""
+    
+    _client: Optional[chromadb.ClientAPI] = None
+    _collection: Optional[chromadb.Collection] = None
 
+    @classmethod
+    def get_client(cls) -> chromadb.ClientAPI:
+        if cls._client is None:
+            persist_dir = settings.vector_db.persist_directory
+            os.makedirs(persist_dir, exist_ok=True)
+            cls._client = chromadb.PersistentClient(path=persist_dir)
+        return cls._client
 
-def init_database():
-    """Create extensions, tables, and indexes if they don't exist."""
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        # Enable extensions
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-
-        dim = settings.embedding.dimension
-
-        # Main chunks table
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS document_chunks (
-                id          TEXT PRIMARY KEY,
-                doc_id      TEXT NOT NULL,
-                title       TEXT NOT NULL DEFAULT '',
-                content     TEXT NOT NULL,
-                chunk_index INTEGER NOT NULL DEFAULT 0,
-                metadata    JSONB DEFAULT '{{}}'::jsonb,
-                embedding   vector({dim}),
-                created_at  TIMESTAMPTZ DEFAULT NOW()
-            );
-        """)
-
-        # Vector similarity index (IVFFlat for scale)
-        cur.execute(f"""
-            CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-            ON document_chunks
-            USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100);
-        """)
-
-        # Full-text search index
-        cur.execute("""
-            ALTER TABLE document_chunks
-            ADD COLUMN IF NOT EXISTS fts_vector tsvector
-            GENERATED ALWAYS AS (
-                to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))
-            ) STORED;
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chunks_fts
-            ON document_chunks USING gin(fts_vector);
-        """)
-
-        # Trigram index for fuzzy matching
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_chunks_content_trgm
-            ON document_chunks USING gin(content gin_trgm_ops);
-        """)
-
-        conn.commit()
-        logger.info("✅ Database initialized successfully")
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"❌ Database init failed: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ── CRUD ─────────────────────────────────────────────────────
-def insert_chunks(chunks: List[DocumentChunk], batch_size: int = 100):
-    """Batch-insert document chunks with embeddings."""
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i : i + batch_size]
-            values = []
-            for c in batch:
-                values.append((
-                    c.id,
-                    c.doc_id,
-                    c.title,
-                    c.content,
-                    c.chunk_index,
-                    json.dumps(c.metadata),
-                    c.embedding,
-                ))
-            psycopg2.extras.execute_values(
-                cur,
-                """
-                INSERT INTO document_chunks
-                    (id, doc_id, title, content, chunk_index, metadata, embedding)
-                VALUES %s
-                ON CONFLICT (id) DO NOTHING
-                """,
-                values,
-                template="(%s, %s, %s, %s, %s, %s::jsonb, %s::vector)",
+    @classmethod
+    def get_collection(cls) -> chromadb.Collection:
+        if cls._collection is None:
+            client = cls.get_client()
+            cls._collection = client.get_or_create_collection(
+                name=settings.vector_db.collection_name,
+                metadata={"hnsw:space": settings.vector_db.distance_metric}
             )
-            conn.commit()
-            logger.info(f"  Inserted batch {i // batch_size + 1} ({len(batch)} chunks)")
-        logger.info(f"✅ Inserted {len(chunks)} chunks total")
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"❌ Insert failed: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
+        return cls._collection
 
+    @classmethod
+    def insert_chunks(cls, chunks: List[DocumentChunk]):
+        """Insert chunks into ChromaDB."""
+        collection = cls.get_collection()
+        
+        ids = [c.id for c in chunks]
+        embeddings = [c.embedding for c in chunks]
+        documents = [c.content for c in chunks]
+        metadatas = []
+        for c in chunks:
+            m = c.metadata.copy()
+            m["doc_id"] = c.doc_id
+            m["title"] = c.title
+            m["chunk_index"] = c.chunk_index
+            metadatas.append(m)
+
+        # Batch insert
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            documents=documents,
+            metadatas=metadatas
+        )
+        logger.info(f"✅ Inserted {len(chunks)} chunks into ChromaDB")
+
+    @classmethod
+    def vector_search(cls, query_embedding: List[float], top_k: int = 20, 
+                      filter_dict: Optional[dict] = None) -> List[dict]:
+        """Search ChromaDB by embedding with optional metadata filtering."""
+        collection = cls.get_collection()
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"],
+            where=filter_dict
+        )
+
+        
+        formatted = []
+        if not results["ids"]:
+            return []
+            
+        for i in range(len(results["ids"][0])):
+            cid = results["ids"][0][i]
+            meta = results["metadatas"][0][i]
+            doc = results["documents"][0][i]
+            dist = results["distances"][0][i]
+            
+            # Convert distance to similarity score if needed (Chroma distances vary by metric)
+            # For cosine, distance is 1 - similarity. So similarity = 1 - distance.
+            score = 1 - dist if settings.vector_db.distance_metric == "cosine" else dist
+            
+            formatted.append({
+                "id": cid,
+                "doc_id": meta.get("doc_id"),
+                "title": meta.get("title", ""),
+                "content": doc,
+                "chunk_index": meta.get("chunk_index", 0),
+                "metadata": meta,
+                "score": score
+            })
+        return formatted
+
+    @classmethod
+    def get_chunk_count(cls) -> int:
+        try:
+            return cls.get_collection().count()
+        except Exception:
+            return 0
+
+
+# Legacy function names for compatibility with other modules
+def init_database():
+    VectorDB.get_collection()
+
+def insert_chunks(chunks: List[DocumentChunk]):
+    VectorDB.insert_chunks(chunks)
 
 def vector_search(
-    query_embedding: List[float], top_k: int = 20
+    query_embedding: List[float],
+    top_k: int = 20,
+    filter_dict: Optional[dict] = None,
 ) -> List[dict]:
-    """Cosine-similarity search via pgvector."""
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute(
-            """
-            SELECT id, doc_id, title, content, chunk_index, metadata,
-                   1 - (embedding <=> %s::vector) AS score
-            FROM document_chunks
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-            """,
-            (query_embedding, query_embedding, top_k),
-        )
-        return cur.fetchall()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def fts_search(query: str, top_k: int = 20) -> List[dict]:
-    """Full-text search with ts_rank scoring."""
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute(
-            """
-            SELECT id, doc_id, title, content, chunk_index, metadata,
-                   ts_rank_cd(fts_vector, plainto_tsquery('english', %s)) AS score
-            FROM document_chunks
-            WHERE fts_vector @@ plainto_tsquery('english', %s)
-            ORDER BY score DESC
-            LIMIT %s
-            """,
-            (query, query, top_k),
-        )
-        return cur.fetchall()
-    finally:
-        cur.close()
-        conn.close()
-
+    return VectorDB.vector_search(query_embedding, top_k, filter_dict)
 
 def get_chunk_count() -> int:
-    """Return total number of stored chunks."""
-    conn = get_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT COUNT(*) FROM document_chunks;")
-        return cur.fetchone()[0]
-    except Exception:
-        return 0
-    finally:
-        cur.close()
-        conn.close()
-
+    return VectorDB.get_chunk_count()
 
 def check_connection() -> bool:
-    """Quick health-check for DB connectivity."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1;")
-        cur.close()
-        conn.close()
+        VectorDB.get_client().heartbeat()
         return True
     except Exception:
         return False

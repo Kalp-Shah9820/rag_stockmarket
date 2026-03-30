@@ -146,7 +146,7 @@ with st.sidebar:
         st.caption(f"Embedding: `{stats.get('embedding_model', 'N/A')}`")
         st.caption(f"Re-ranker: `{stats.get('reranker_model', 'N/A')}`")
     except Exception:
-        st.error("🔴 API Offline — Start with: `uvicorn api.main:app`")
+        st.error("🔴 API Offline — Start with: `python -m uvicorn api.main:app --reload`")
 
     st.markdown("---")
     st.markdown("### 📋 Sample Queries")
@@ -164,7 +164,8 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "<p style='text-align: center; color: #606070; font-size: 0.8rem;'>"
-        "Built with LangGraph • pgvector • FastAPI</p>",
+        "Built with LangGraph • ChromaDB • BM25 • FastAPI</p>",
+
         unsafe_allow_html=True,
     )
 
@@ -255,7 +256,7 @@ if query:
                         "content": err,
                     })
             except httpx.ConnectError:
-                err = "❌ Cannot connect to API. Start it with: `uvicorn api.main:app`"
+                err = "❌ Cannot connect to API. Start it with: `python -m uvicorn api.main:app --reload`"
                 st.error(err)
                 st.session_state.messages.append({
                     "role": "assistant",

@@ -12,15 +12,13 @@ With retry loops for insufficient context.
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict, List, Optional
-import operator
+from typing import TypedDict, List, Optional
 
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 from loguru import logger
 
 from src.config import settings
+from src.gemini_client import generate_text
 from src.models import RetrievedChunk, GeneratedAnswer
 from src.guardrails import check_query_safety, check_topic_relevance, check_context_relevance
 from src.retriever import hybrid_retrieve
@@ -43,6 +41,9 @@ class RAGState(TypedDict):
     retry_count: int
     error_message: str
     status: str  # "processing" | "success" | "blocked" | "error"
+    intent: str   # "news" | "reports" | "general"
+    source_filter: Optional[str]
+
 
 
 # ── Node functions ───────────────────────────────────────────
@@ -103,24 +104,51 @@ def rewrite_query(state: RAGState) -> RAGState:
             "the rewritten query."
         )
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, max_tokens=100)
-    response = llm.invoke([
-        SystemMessage(content=prompt),
-        HumanMessage(content=query),
-    ])
-    rewritten = response.content.strip()
-    logger.info(f"📝 Query rewritten: '{query}' → '{rewritten}'")
-
+    rewritten = generate_text(
+        query,
+        system_instruction=prompt,
+        temperature=0.3,
+        max_output_tokens=100,
+        thinking_budget=0,
+    )
+    logger.info(f"Query rewritten: '{query}' -> '{rewritten}'")
     return {**state, "rewritten_query": rewritten}
+
+def route_query(state: RAGState) -> RAGState:
+    """Classify query intent to route to correct data source."""
+    query = state.get("rewritten_query") or state["original_query"]
+    
+    prompt = (
+        "Classify the following stock market question into one of three "
+        "categories: 'news', 'reports', or 'general'. Return ONLY the single "
+        "word of the category."
+    )
+    
+    intent = generate_text(
+        query,
+        system_instruction=prompt,
+        temperature=0.0,
+        max_output_tokens=20,
+        thinking_budget=0,
+    ).strip().lower()
+    
+    # Simple mapping
+    if intent not in ["news", "reports", "general"]:
+        intent = "news" # Fallback
+        
+    logger.info(f"🛣️ Query routed: category='{intent}'")
+    return {**state, "intent": intent, "source_filter": intent if intent != "general" else None}
 
 
 def retrieve(state: RAGState) -> RAGState:
-    """Run hybrid retrieval."""
+    """Run hybrid retrieval with source routing."""
     query = state.get("rewritten_query") or state["original_query"]
-    logger.info(f"🔍 Retrieving for: {query[:80]}...")
-
-    chunks = hybrid_retrieve(query)
+    source = state.get("source_filter")
+    logger.info(f"🔍 Retrieving for: {query[:80]}... (filter: {source})")
+    
+    chunks = hybrid_retrieve(query, source_filter=source)
     return {**state, "retrieved_chunks": chunks}
+
 
 
 def check_relevance(state: RAGState) -> RAGState:
@@ -226,6 +254,7 @@ def build_rag_graph() -> StateGraph:
     # Add nodes
     graph.add_node("validate_query", validate_query)
     graph.add_node("rewrite_query", rewrite_query)
+    graph.add_node("route_query", route_query)
     graph.add_node("retrieve", retrieve)
     graph.add_node("check_relevance", check_relevance)
     graph.add_node("rerank_chunks", rerank_chunks)
@@ -246,8 +275,10 @@ def build_rag_graph() -> StateGraph:
     )
 
     # Linear edges
-    graph.add_edge("rewrite_query", "retrieve")
+    graph.add_edge("rewrite_query", "route_query")
+    graph.add_edge("route_query", "retrieve")
     graph.add_edge("retrieve", "check_relevance")
+
 
     # Conditional: relevant context → rerank, else → handle
     graph.add_conditional_edges(
@@ -294,7 +325,10 @@ def run_agent(query: str) -> GeneratedAnswer:
         "retry_count": 0,
         "error_message": "",
         "status": "processing",
+        "intent": "general",
+        "source_filter": None,
     }
+
 
     logger.info(f"🤖 Running RAG agent for: {query[:80]}...")
     result = rag_agent.invoke(initial_state)

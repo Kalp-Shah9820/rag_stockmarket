@@ -11,11 +11,10 @@ from __future__ import annotations
 import re
 from typing import Tuple
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 from loguru import logger
 
 from src.config import settings
+from src.gemini_client import generate_text
 
 
 # ── PII patterns ─────────────────────────────────────────────
@@ -58,19 +57,17 @@ def check_topic_relevance(query: str) -> Tuple[bool, str]:
     cfg = settings.guardrails
     allowed = ", ".join(cfg.allowed_topics)
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=50)
-    messages = [
-        SystemMessage(
-            content=(
-                "You are a topic classifier. Determine if the user's query is "
-                f"related to any of these topics: {allowed}. "
-                "Respond with exactly 'YES' or 'NO'."
-            )
+    decision = generate_text(
+        query,
+        system_instruction=(
+            "You are a topic classifier. Determine if the user's query is "
+            f"related to any of these topics: {allowed}. "
+            "Respond with exactly 'YES' or 'NO'."
         ),
-        HumanMessage(content=query),
-    ]
-    response = llm.invoke(messages)
-    decision = response.content.strip().upper()
+        temperature=0.0,
+        max_output_tokens=10,
+        thinking_budget=0,
+    ).strip().upper()
 
     if "YES" in decision:
         return True, "Topic is relevant"
@@ -93,22 +90,19 @@ def check_context_relevance(
 
     combined = "\n---\n".join(context_snippets[:3])  # Check top 3
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=50)
-    messages = [
-        SystemMessage(
-            content=(
-                "Rate how relevant the following context is to the query. "
-                "Respond with a single number from 0.0 to 1.0."
-            )
-        ),
-        HumanMessage(
-            content=f"Query: {query}\n\nContext:\n{combined}"
-        ),
-    ]
-    response = llm.invoke(messages)
-
     try:
-        score = float(response.content.strip())
+        score = float(
+            generate_text(
+                f"Query: {query}\n\nContext:\n{combined}",
+                system_instruction=(
+                    "Rate how relevant the following context is to the query. "
+                    "Respond with a single number from 0.0 to 1.0."
+                ),
+                temperature=0.0,
+                max_output_tokens=10,
+                thinking_budget=0,
+            ).strip()
+        )
     except ValueError:
         score = 0.5  # Default if parsing fails
 

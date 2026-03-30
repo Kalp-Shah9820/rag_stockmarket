@@ -7,14 +7,21 @@ app:
   version: "1.0.0"
   log_level: "INFO"
 
-# ---------- Database ----------
-database:
-  host: "localhost"
-  port: 5432
-  name: "rag_stockmarket"
-  user: "rag_user"
-  password: "rag_password"
-  pool_size: 5
+
+# ---------- Vector Database (ChromaDB) ----------
+vector_db:
+  type: "chroma"           # "chroma" | "weaviate"
+  persist_directory: "./data/chroma_db"
+  collection_name: "stock_news_chunks"
+  distance_metric: "cosine" # "cosine" | "l2" | "ip"
+
+# ---------- Keyword Search (BM25) ----------
+keyword_search:
+  type: "bm25"
+  persist_path: "./data/bm25_index.pkl"
+  k1: 1.5
+  b: 0.75
+
 
 # ---------- Embedding ----------
 embedding:
@@ -51,9 +58,19 @@ reranker:
 
 # ---------- LLM / Generator ----------
 generator:
-  model: "gpt-4o-mini"
+  provider: "gemini"
+  model: "gemini-2.5-flash"
+  fallback_models:
+    - "gemini-2.5-flash-lite"
+    - "gemini-2.0-flash"
   temperature: 0.1
   max_tokens: 1024
+  retry_max_tokens: 2048
+  thinking_budget: 0
+  max_context_chars: 12000
+  max_chunk_chars: 2500
+  timeout_seconds: 30
+  validate_model_on_startup: true
   system_prompt: |
     You are a financial news analyst. Answer questions using ONLY the
     provided context. Cite every claim with [Source N]. If the context
@@ -81,7 +98,8 @@ agent:
 dataset:
   name: "XA7-stock-market-news"
   source: "huggingface"
-  hf_repo: "Lettria/XA7-stock-market-news"
+  hf_repo: "XA7/News-dataset-for-Stock-Market-news-classification"
+
   split: "train"
 
 # ---------- Evaluation ----------
